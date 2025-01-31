@@ -1,0 +1,387 @@
+#!/usr/bin/perl -w
+use strict;
+
+use File::Spec      qw< >;
+use Getopt::Long    qw< >;
+
+my $MaxDetail = 3;
+my $ForApply = 0;
+# my $Overlap = 0;
+
+
+Main( @ARGV );
+exit;
+
+
+sub Usage {
+    my( @msg ) = @_;
+    warn @msg, $/, $/
+        if  @msg  &&  "@msg";
+    warn "Usage: git sdiff [-hiolnpa] [-d3] [stashes|--] [diff-opts] [paths]\n";
+    if(  @msg  ) {
+        warn sprintf "    %s\n%s\n", join( "\n    ",
+            'stashes:    Defaults to all stash.  Can be stash@{2} or just 2.',
+            '            Use ranges like -3,5-6,8- (for all but 4 and 7).',
+            'diff-opts:  -b, -w, --numstat, -Sfoo, -R, etc.',
+            'paths:      Tells git-diff to report only diffs for those files',
+        ),
+        "Run 'git sdiff -u' for more usage info.";
+        exit( 1 );
+    }
+    warn sprintf "    %s\n", join "\n    ",
+       'Replacement for "git stash list/show".  Runs git-diff comparing',
+       'each stashed tree with its HEAD or index (or some other commit).',
+       'Options:',
+       '    --head:     Compares to the stashed HEAD (also -h).',
+       '                Default unless ..COMMIT given.',
+       '    --index:    Compares to the stashed index (also -i).',
+       '                -hi compares stashed index to stashed HEAD.',
+       '                The stashed working tree is the other commit compared',
+       '                unless two of -h, -i, and ..COMMIT are given.)',
+#      '    --overlap:  Estimates how much of the diff still applies (also -o).',
+#      "                Implies -n.  Can't be used with -i, -p, nor -a.",
+       "    --lcs:      Don't pass --patience to git-diff (also -l).",
+       "    --detail=3: Show up to N lines of detail per stash (-d3 default).",
+       '                -dx shows all details (-d0 none).',
+       '    -n:         Adds "--numstat --shortstat" to the git-diff opts.',
+       '    -p:         Adds "--patch" to git-diff opts (implies "-dx").',
+       '    --apply:    Allow git-apply (also -a; implies -p).',
+       '    stashes:    Stash number(s).  Defaults to all stashes.',
+       '                Can list ranges: -3,5-6,8- (all but 4 and 7).',
+       '                "stash@{...}" is not required.  Can prepend "COMMIT.."',
+       '                or append "..COMMIT" to compare each stash to COMMIT.',
+       '                "..:" or ":.." compares to current index.  Just ".."',
+       '                compares to current working tree (not current HEAD).',
+       '    --:         If no stashes (nor commit) listed, can precede',
+       '                diff-opts by -- to avoid confusing get-opt.',
+       '    diff-opts:  Any options (or arguments) understood by git-diff.',
+       '                --patience is assumed.  -b, -w, --numstat, etc.',
+       '    paths:      Just more arguments to git-diff.  Only show diffs',
+       '                for the listed files/directories.',
+    ;
+    exit( 0 );
+}
+
+
+sub IsStashList {
+    my( $str ) = @_;
+    return  $str =~ /^stash\@\{[0-9]+}$/
+        ||  $str =~ /^ ( (?=-?[0-9]) [0-9]*-?[0-9]* (,|$) )+ $/x;
+}
+
+
+sub AsCommit {
+    my( $commit ) = @_;
+    # If given a bare stash number, turn it into a commit
+    $commit = "stash\@{$commit}"
+        if  $commit =~ /^[1-9][0-9]*$/;
+    return $commit;
+}
+
+
+sub CmdLineOpts {
+    local( @ARGV ) = @_;
+    my $relative = '';
+    my $noPatience = 0;
+    my $numStat = 0;
+    my $showPatches = 0;
+    Getopt::Long::Configure(
+        'no_getopt_compat', # No +foo
+        'gnu_compat',       # Allow --foo= (for empty string)
+        'bundling',         # Allow -ip (for -i -p)
+        'require_order',    # Stop at non-option
+        'pass_through',     # Stop at unknown option (--numstat)
+    );
+    Getopt::Long::GetOptions(
+        'h|head'        => sub { $relative =~ s/h|$/h/ },
+        'i|index'       => sub { $relative =~ s/i|$/i/ },
+#       'o|overlap'     => \$Overlap,
+        'l|lcs'         => \$noPatience,
+        'n'             => \$numStat,
+        'p'             => \$showPatches,
+        'd|detail=s'    => \$MaxDetail,
+        'a|apply'       => \$ForApply,
+        'u'             => sub { Usage() },
+    )   or  Usage('');  # Not that it seems possible to fail as configured.
+    unshift @ARGV, '--'
+        if  @ARGV < @_  &&  '--' eq $_[ $#_ - @ARGV ];
+
+#   if(  $Overlap  ) {
+#       Usage("Can't combine --overlap with --index")
+#           if  $relative =~ /i/;
+#       Usage("Can't combine --overlap with --patch nor --apply")
+#           if  $showPatches  ||  $ForApply;
+#   }
+    if(  $MaxDetail =~ /^[^0-9]$/  ) {
+        $MaxDetail = -1
+    } elsif(  $MaxDetail =~ /[^0-9]/  ) {
+        Usage( "Invalid value after -d ($MaxDetail)" )
+    }
+    Usage( "Value required after -d" )
+        if  @ARGV  &&  $ARGV[0] =~ /^-(d|-detail)$/;
+    $MaxDetail = -1
+        if  $ForApply  ||  $showPatches;
+
+    my $which = '';
+    $which = shift @ARGV
+        if  @ARGV
+        &&  grep IsStashList($_), split /[.]{2,3}/, $ARGV[0];
+    if(  @ARGV  &&  '--' eq $ARGV[0]  ) {
+        ;   # shift @ARGV;
+    } elsif(  ! $which  &&  2 <= @ARGV  &&  '--' eq $ARGV[1]  ) {
+        warn "Invalid stash list ($ARGV[0])?  Passing it to git-diff.\n";
+    }
+
+    my @diffOpts = @ARGV;
+    if(  $ForApply  ||  $showPatches  ) {
+        unshift @diffOpts, '-p';
+        die "Can't combine -a or -p with -n\n"
+            if  $numStat;
+    } else {
+        unshift @diffOpts, '--numstat', '--shortstat'
+            if  $numStat;
+        unshift @diffOpts, '--stat'
+            if  ! @diffOpts
+            ||  $diffOpts[0] !~ /^-/;
+    }
+    unshift @diffOpts, '--patience'
+        if  ! $noPatience;
+
+    my $commit = '';
+    my @compare = split /([.]{2,3})/, $which, -1;
+    if(  @compare < 2  ) {
+        ;
+    } elsif(  3 != @compare  ) {
+        Usage( "More than one '..' in stash/commit list? ($which)" );
+    } else {
+        my $sep = splice @compare, 1, 1;
+        my @stashCount = map {
+            ! IsStashList($_)
+                ?   0   # No stashes (treat as a commitish)
+            : /[-,]/
+                ?   2   # More than one stash
+                :   1   # Just a single stash
+        } @compare;
+        Usage( "stashes..stashes not supported ($which)" )
+            if  1 < $stashCount[0]  &&  1 < $stashCount[1];
+        Usage( "One side must be stashlist in commit..commit ($which)" )
+            if  ! $stashCount[0]  &&  ! $stashCount[1];
+        if(  1 < $stashCount[0]  ||  0 == $stashCount[1]  ) {
+            # Treat $compare[0] as the stash list, $compare[1] as a commitish
+            $which = $compare[0];
+            if(  '/' eq $compare[1]  ) {        # "../"
+                $commit = '!';
+            } elsif(  ':' eq $compare[1]  ) {   # "..:"
+                $commit = '!';
+                push @diffOpts, '--cached';
+            } else {                            # "..COMMIT"
+                $commit = $sep . AsCommit($compare[1]);
+            }
+        } else {
+            # Treat $compare[0] as a commitish, $compare[1] as the stash list
+            if(  '/' eq $compare[0]  ) {        # "/.."
+                $commit = '!';
+                push @diffOpts, '-R';
+            } elsif(  ':' eq $compare[0]  ) {   # ":.."
+                $commit = '!';
+                push @diffOpts, qw< -R --cached >;
+            } else {                            # "COMMIT.."
+                $commit = AsCommit($compare[0]) . $sep;
+            }
+            $which = $compare[1];
+        }
+    }
+    $which = '00'
+        if  '0' eq $which;
+
+    my $parent;
+    if(  ! $relative  ) {               # default:
+        $parent = $commit ? '' : '^1';  #   parent is HEAD if no ..COMMIT
+    } elsif(  'h' eq $relative  ) {     # --head:
+        $parent = '^1';                 #   (default only if no ..COMMIT)
+    } elsif(  'i' eq $relative  ) {     # --index:
+        $parent = '^2';                 #   parent is always index
+    } else {                            # -hi:
+        Usage( "Can't combine -hi with a commit ($commit)" )
+            if  $commit;
+        $parent = '^1';
+        $commit = '^2';
+    }
+    return( $which, $parent, $commit, @diffOpts );
+}
+
+
+sub GetCommitPair {
+    my( $stash, $parent, $commit ) = @_;
+    $stash = "stash\@{$stash}";
+    return "$stash$parent..$stash$commit"
+        if  $commit =~ /^\^/;
+    return "$stash$parent"
+        if  '!' eq $commit;
+    return "$stash$parent..$stash"
+        if  ! $commit;
+    return "$stash$parent$commit"
+        if  $commit =~ /^[.]/;
+    return "$commit$stash$parent"
+}
+
+
+sub GetStashData {
+    open my $list, "-|", qw< git stash list >
+        or  die "Can't fork() to run git-stash list: $!\n";
+    my @data;
+    while(  <$list>  ) {
+        die "Unrecognized 'git-stash list' output:\n    $_"
+            if  ! /^stash\@\{([0-9]+)}: (?:(.*?) on|On) ([^:]+): (.*)$/
+            &&  ! /^stash\@\{([0-9]+)}: ()()(autostash)$/
+            &&  ! /^stash\@\{([0-9]+)}: ()()(filter-branch: rewrite)$/;
+        my( $idx, $wip, $branch, $desc ) = ( $1, $2, $3, $4 );
+        $desc = "WIP after: $desc"
+            if  $wip;
+        my $count = @data;
+        die "Stash out of sequence, not stash\@{$count}: $_"
+            if  $idx != $count;
+        push @data, [ $desc, $branch ];
+    }
+    close $list;
+    exit 1
+        if  0 != $?;
+    return @data;
+}
+
+
+sub ExpandStashList {
+    my( $which, $max ) = @_;
+    for(  $which  ) {
+        s/ stash\@\{(.*?)} /$1/gx;
+        s/-/../g;
+        s/ (?<![.0-9])[.] /0./gx;
+        s/ [.](?![.0-9]) /.$max/gx;
+    }
+    my @stashes = eval $which
+        or  die "Invalid stash list ($which).\n";
+    return @stashes;
+}
+
+
+sub RunDiff {
+    my( $stash, $parent, $commit, @diffOpts ) = @_;
+    my $pair = GetCommitPair( $stash, $parent, $commit );
+    open my $err, ">&", \*STDERR
+        or  die "Can't save STDERR: $!\n";
+    open STDERR, '>', File::Spec->devnull();
+
+    open my $diff, "-|", qw< git diff >, $pair, @diffOpts
+        or  die "Can't fork() to run git-diff: $!\n";
+
+    if(  ! open STDERR, '>&', $err  ) {
+        print "Can't restore STDERR: $!\n";
+        exit 1;
+    }
+    my @output;
+    while(  <$diff>  ) {
+        next
+            if  ! $ForApply
+            &&  /^index /  ||  /^[-+]{3} /;
+#       if(  s/^(-|\d+)\t(-|\d+)\t//  ) {
+#           my( $add, $del ) = ( $1, $2 );
+#           $add =  "-" eq $add  ?  "n/a"  :  "+$add";
+#           $del =  "-" eq $del  ?  "n/a"  :  "-$del";
+#           $_ = sprintf "%-5s %-5s %s", $del, $add, $_;
+#       }
+        push @output, $_;
+    }
+    close $diff;
+    Usage( "git-diff doesn't support ($?): $pair @diffOpts" )
+        if  0 != $?;
+    return @output;
+}
+
+
+#   sub Subtract {
+#       my( $diffs, $idx, $commit, @diffOpts ) = @_;
+#       my @d
+#       if(  $commit  ) {
+#       } else {
+#       }
+#       my %ds;
+#       for my $d (  @$diffs  ) {
+#           my( $sub, $add, $path ) = split ' ', $d;
+#           $ds{$path} = [ $sub, $add ];
+#       }
+#       my @paths = keys %dh;
+#       my @d2 = RunDiff( $idx, '^2', $commit, @diffOpts );
+#       for my $d (  @d2  ) {
+#           my( $sub, $add, $path ) = split ' ', $d;
+#           push @paths, $path
+#               if  ! $dh{$path};
+#           $di{$path} = [ $sub, $add ];
+#       }
+#       for my $path (  sort @paths  ) {
+#           my @head = $dh{$path};
+#           my @index = $di{$path};
+#       }
+#           my @head = split ' ', $diffs->[$i];
+#           my @index = split ' ', $d2[$i];
+#           die "Unexpected diff output (@head).\n"
+#               if  3 != @head;
+#           die "Unexpected diff output (@index).\n"
+#               if  3 != @index;
+#           die "Different paths \n"
+#               if  $head[2] != $index[2];
+#       }
+
+
+sub Report {
+    my( $idx, $desc, $branch, $parent, $commit, @diffOpts ) = @_;
+
+    my @diffs = RunDiff( $idx, $parent, $commit, @diffOpts );
+    return
+        if  ! @diffs;
+#   if(  $Overlap  ) {
+#       @diffs = Subtract( \@diffs, $idx, $commit, @diffOpts );
+#   }
+    if(  $MaxDetail < 0  ) {
+        print "\nstash\@{$idx}: $desc", $branch ? " (on $branch)" : "", "\n\n"
+            if  ! $ForApply;
+        print $_
+            for(  @diffs  );
+        return;
+    }
+    my $sum;
+    if(  $diffs[-1] =~ / [0-9]+ insert/  ) {
+        $sum = pop @diffs;
+    } else {
+        ( $sum ) = RunDiff( $idx, $parent, $commit, '--shortstat' );
+    }
+    my( $files ) = $sum =~ /\b([0-9]+) files?\b/;
+    my( $adds ) =  $sum =~ /\b([0-9]+) insert/;
+    my( $dels ) =  $sum =~ /\b([0-9]+) delet/;
+    $_ //= '?'
+        for( $files, $adds, $dels );
+    printf "%-3d (%4s %-5s %-5s): %s (on %s)\n",
+        $idx, "$files:", "-$dels", "+$adds", $desc, $branch;
+    if(  @diffs <= $MaxDetail  ) {
+        print "    $_"
+            for(  @diffs  );
+    }
+}
+
+
+sub Main {
+    my( $which, $parent, $commit, @diffOpts ) = CmdLineOpts( @_ );
+    my @data = GetStashData();
+    my $max = $#data;
+    my @stashes = 0..$max;
+    @stashes = ExpandStashList( $which, $max )
+        if  $which;
+    for my $idx (  @stashes  ) {
+        die "No stash\@{$idx} exists\n"
+            if  ! $data[$idx];
+        my( $desc, $branch ) = @{ $data[$idx] };
+        Report( $idx, $desc, $branch, $parent, $commit, @diffOpts );
+    }
+}
+
+
+__END__

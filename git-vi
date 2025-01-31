@@ -1,0 +1,10 @@
+#!/bin/bash
+
+if [[  0 == $#  ]]; then
+    vi $( (
+        git relstat -uno | awk '{print $2}';
+        git ns -Td @{u}.. 2>/dev/null | awk '{print $3}'
+    ) | sort -u ) ~/.vimrc
+else
+    vi $( git files -E "$@" )
+fi

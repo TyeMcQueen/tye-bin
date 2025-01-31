@@ -1,0 +1,226 @@
+#!/usr/bin/perl -w
+use strict;
+
+my $AbortFile = ".git/StopGvd";
+my @TempFiles;
+
+Main( @ARGV );
+exit;
+
+
+sub DropTempFiles {
+    while(  @TempFiles  ) {
+        my $file = pop @TempFiles;
+        unlink $file
+            or  warn "Can't delete $file: $!\n";
+    }
+}
+END { DropTempFiles() }
+
+
+sub Usage {
+    my( @msg ) = @_;
+    warn @msg, $/
+        if  @msg;
+    die "Usage: git [g|e]vd REV1 [ REV2 [REV3 [...] PATH] ]\n",
+        "   or: git [g|e]vd REV1 [REV2 [...]] -- PATH [...]\n",
+        "   or: git [g|e]vd -q # Stop launching more editor windows\n",
+        "    A REV can be :[{0-3}|base|ours|we|theirs|they] (index).\n",
+        "    A REV can be / (working tree) (or .).\n",
+        "    If REV2 (or later) begins with ^ or ~, then REV1 is prepended.\n",
+        "    PATH can be a directory to view changed files under there.\n",
+        "    Example:  git vd . HEAD \@{u} -- :!vendor/\n",
+        "    'git vd REV' is short for 'git vd REV ^ .'.\n",
+        "    'git vd REV1 REV2' is short for 'git vd REV1 REV2 .'.\n",
+    ;
+}
+
+
+sub AbortCurrent {
+    my( $doAbort ) = @_;
+    our $GitRoot ||= join '/',
+        qx[ git rev-parse --show-toplevel ],
+        $AbortFile;
+    if( $doAbort ) {
+        open my $fh, '>', $AbortFile
+            or  die "Can't create $AbortFile: $!\n";
+        warn "Will abort git-gvd after editor exits.\n";
+        exit;
+    }
+    return 0
+        if  ! -e $AbortFile;
+    unlink( $AbortFile )
+        or  warn "Can't delete $AbortFile: $!\n";
+    warn "Aborting (somebody ran 'git-gvd -q').\n";
+    return 1;
+}
+
+
+sub ParseRev {
+    my( $rev, $prev ) = @_;
+
+    $rev =~ s/^:?/:/            # Change 0: to :0
+        if   $rev =~ s/:$//;    # Change :0: to :0
+    $rev = "$prev$rev"
+        if  $prev  &&  $rev =~ /^[~^]/;
+    $rev = '/'
+        if  '.' eq $rev;
+
+    return $rev;
+}
+
+
+sub GetFileRev {
+    my( $spec, $rev ) = @_;
+    my $tmp = $ENV{TMPDIR} || '/tmp';
+
+    for my $path (  split / => /, $spec  ) {
+        if(  $rev ne '/'  &&  $rev ne '.'  ) {
+            my $lab = $rev;
+            $lab =~ s/^:$/index/;
+            $lab =~ s/^:/index-/;
+
+            my $file = $path;
+            $file =~ s|^.*/||;
+            $file = "$lab.$file";
+            $file =~ s-/-_-g;
+            $file = "$tmp/$file";
+            if(  0 == system( qq{ git cat "$rev" "$path" > "$file" } )  ) {
+                push @TempFiles, $file;
+                return $file;
+            }
+            warn "Warning! Failed: git cat '$rev' '$path' > '$file'\n";
+            unlink($file);
+            $spec = $file; # Return a temp path if git-cat never succeeds.
+        } elsif(  -f $path  ) {
+            return $path;
+        }
+    }
+    return $spec;
+}
+
+
+sub Editor {
+    our $Editor;
+    if(  ! $Editor  ) {
+        if(  $0 =~ /git-g/  ) {
+            $Editor = [qw< gvim -f -d >];
+        } elsif(  $0 =~ /git-e/  ) {
+            $Editor = [];
+        } else {
+            $Editor = [qw< vim -d >];
+        }
+    }
+    return @$Editor;
+}
+
+
+sub ShowDiff {
+    my( $path, @revs ) = @_;
+    my @files = map GetFileRev( $path, $_ ), @revs;
+    my @e = Editor();
+    if(  @e  ) {
+        system( Editor(), @files );
+        DropTempFiles();
+    } else {
+        print "$_\n"
+            for  @files, '';
+    }
+}
+
+
+sub ListFiles {
+    my( $path, @revs ) = @_;
+
+    my $base = shift @revs;
+    my %diffs;
+    my $n = 0;
+    for my $rev ( @revs ) {
+        if( ref $path ) {
+            $_ = qq<"$_">
+                for @$path;
+        } else {
+            $path = [ "--", qq<"$path"> ];
+        }
+        my @diff = qx{ git d --numstat "$base..$rev" @$path };
+        for my $line (  @diff  ) {
+            chomp $line;
+            my( $add, $sub, $file ) = split ' ', $line, 3;
+            s/-/?/
+                for $add, $sub;
+            $diffs{$file}[$n] = "-$sub+$add";
+        }
+        $n++;
+    }
+    my @files = sort keys %diffs;
+}
+
+
+sub MaybeAMerge {
+    my( $commit ) = @_;
+    if(  "-q" eq $commit  ||  "--quit" eq $commit  ) {
+        AbortCurrent(1);
+    }
+    my @lines = qx[ git cat-file commit $commit ];
+    my @parents;
+    while( @lines ) {
+        local $_ = shift @lines;
+        last
+            if  /^$/;
+        push @parents, $1
+            if  /^parent (.*)/;
+    }
+    return( 0, $commit, '^' )
+        if  @parents < 2;
+    while( @lines ) {
+        last
+            if  shift(@lines) =~ /^Conflicts:$/;
+    }
+    my @conflicts = map { /^\s*(.*)/ } @lines;
+    # TODO: Support diff'ing files that had to be merged but had no conflicts!
+    die "Merge ($commit) had no conflicts.\n"
+        if  ! @conflicts;
+    return( \@conflicts, $commit, @parents );
+}
+
+
+sub Main {
+    my @args = @_;
+    Usage()
+        if  ! @args;
+    ( my $path, @args ) = MaybeAMerge( $args[0] )
+        if  1 == @args;
+    push @args, '.'
+        if  2 == @args;
+    my( $sep ) = grep "--" eq $args[$_], 0..$#args;
+    if( ! defined $sep ) {
+        $path ||= pop @args;
+    } else {
+        $path = [ splice @args, $sep ];
+    }
+
+    my @revs;
+    for my $rev (  @args  ) {
+        push @revs, ParseRev( $rev, $revs[0] );
+    }
+
+    my @files;
+    if(  ref $path  ) {
+        if( "--" eq $path->[0] ) {
+            @files = ListFiles( $path, @revs );
+        } else {
+            @files = @$path;
+        }
+    } elsif(  -f $path  ) {
+        ShowDiff( $path, @revs );
+        return;
+    } else {
+        @files = ListFiles( $path, @revs );
+    }
+
+    for my $file (  @files  ) {
+        ShowDiff( $file, @revs );
+        exit 1
+            if  AbortCurrent();
+    }
+}

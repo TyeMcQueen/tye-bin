@@ -1,0 +1,124 @@
+#!/usr/bin/perl -w
+use Encode;
+use Time::Local 'timegm';
+BEGIN {
+    if(  eval { require feature; 1 }  ) {
+        ( my $ver= $^V ) =~ s/^v/:/;
+        feature->import($ver);
+    }
+}
+my $Strict= "no strict;\n";
+my $Use= '';
+
+sub dump_string {
+    my( $string ) = @_;
+    $string =~ s/([\\"])/\\$1/g;
+    $string =~ s{([^ -~\n])}{
+        my( $c ) = unpack "C0U", $1;
+        "\\$c"
+    }ge;
+    return qq<"$string">;
+}
+
+sub show_utf8 {
+    my( $utf8 ) = @_;
+    my $safe = $utf8;
+    return( $safe, '=' . dump_string($utf8) );
+}
+
+sub st {    # stamp -> time (epoch seconds)
+    my( $s ) = @_;
+    my @pairs = $s =~ /([0-9][0-9](?:[.][0-9]+)?)/g;
+    if(  @pairs < 6  ||  7 < @pairs  ) {
+        return "0, not 7-6 pairs of digits [$s]";
+    }
+    my( $cc, $yy, $mo, $dd, $hh, $min, $ss ) = @pairs;
+    my $t = timegm( int($ss), $min, $hh, $dd, $mo-1, $cc*100+$yy );
+    $t += $ss - int($ss);
+    return $t;
+}
+
+sub ts {    # time (epoch seconds) -> stamp (string)
+    my( $t ) = @_;
+    my( $ss, $min, $hh, $dd, $mo, $yr ) = gmtime($t);
+    my $s = sprintf "%d-%02d-%02d %02d:%02d:%02d",
+        $yr+1900, 1+$mo, $dd, $hh, $min, $ss;
+    $s .= $1
+        if  $t =~ /([.]\d+)/;
+    return $s . "Z";
+}
+
+sub Say {
+    local( $@ );
+    local( $SIG{__WARN__} )= sub {
+        warn @_
+            if  $_[0] !~ / may clash with future reserved word /;
+    };
+    my @Result= eval "$Strict$Use\n#line 1 'input'\n@_";
+    if(  $@  ) {
+        print "( @_ )\n";
+        $@ =~ s/ at \(eval \d+\) line \d+(\.|, <\w*> line \d+\.)$//;
+        warn $@, $/;
+    }
+    for( @Result ) {
+        if( ! defined ) {
+            print "\\undef";
+        } elsif( Encode::is_utf8($_) ) {
+            print
+                for show_utf8( $_ );
+        } elsif( /\\/ || /[^ -~]/ || /^"/ || /\s$/ ) {
+            print dump_string( $_ );
+        } else {
+            print;
+        }
+    }
+}
+
+my $irs = "\n";
+while(  @ARGV  &&  $ARGV[0] =~ /^-[^-]/  ) {
+    my $opt = shift @ARGV;
+    if(  $opt =~ /^-([pm])$/  ) {
+        # -p: Paragraph mode reading STDIN
+        # -m: one Multi-line expression on STDIN
+        $irs = 'p' eq $1 ? '' : undef;
+    } elsif(  $opt =~ /^-I(.*)/  ) {
+        require lib;
+        lib->import( split /:/, $1 );
+    } elsif(  $opt =~ /^-M([^=]+)(?:=(.*))?$/  ) {
+        my( $mod, $args )= ( $1, $2 );
+        my $line = "use $mod";
+        if(  defined $args  ) {
+            $args =~ s/,/ /g;
+            $line .= " qw( $args )"
+        }
+        $line .= ";\n";
+        if( 'strict' eq $mod  ) {
+            $Strict = $line;
+        } else {
+            $Use .= $line;
+        }
+    } else {
+        die "Unknown option: $opt\n";
+    }
+}
+
+local $\ = "\n";
+if(  @ARGV  ) {
+    Say( @ARGV );
+    exit;
+}
+local $/ = $irs;
+{
+    no warnings;
+    exec( 'rlwrap', $^X, $0 ) if ! $ENV{RLWRAPPED}++;
+}
+while(  <STDIN>  ) {
+    chomp;
+    last
+        if  'q' eq $_;
+    if(  ! /\S/  ) {
+        print;
+    } else {
+        Say( $_ );
+    }
+}

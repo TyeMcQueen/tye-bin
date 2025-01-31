@@ -1,0 +1,31 @@
+#!/usr/bin/perl -w
+use strict;
+
+use Getopt::Long();
+
+Main(@ARGV);
+exit;
+
+
+sub Main {
+    while( <> ) {
+        s{([0-9][0-9_]*)([.][0-9_]+)?(?!-)}{
+            my( $i, $f ) = ( $1, $2 );
+            $f ||= '';
+            if(  $f  ) {
+                $f =~ s/_//g;
+                $f =~ s/([0-9]{3})(?=[0-9])/${1}_/g;
+            }
+            $i =~ s/_//g;
+            if(  3 < length($i)  ) {
+                0 while $i =~ s/([0-9])([0-9]{3})(?![0-9])/${1}_$2/;
+            }
+
+            $i . $f
+        }ge;
+        print;
+    }
+}
+
+__END__
+

@@ -1,0 +1,81 @@
+#!/usr/bin/perl -w
+use strict;
+
+use File::Spec;
+
+my $IsWin=  $^O =~ /win/i  &&  $^O !~ /darwin/i;    # Yes, including cygwin
+
+Main( @ARGV );
+exit;
+
+sub Main
+{
+    my( @pats )= @_;
+    if(  ! @pats  ) {
+        die "Usage: bins *perl*\n    finds all perl executables\n"
+    }
+    my @bins;
+    my %bins;
+    my @exts= ( '' );
+    if(  $IsWin  ) {
+        push @exts, split /;/, lc( $ENV{PATHEXT} || '.com;.exe;.bat;.cmd' );
+    }
+    my @dirs= File::Spec->path();
+    my $gitdir;
+    if(  1 < @pats  &&  "git" eq $pats[0]  ) {
+        shift @pats;
+        my @gits= map /([^\n:]+)/g, qx< git --exec-path >;
+        push @dirs, @gits;
+        $gitdir= $gits[0]
+            if  1 == @gits;
+        s/^/git-/
+            for @pats;
+    }
+    my $multi= 0;
+    for my $pat (  @pats  ) {
+        for my $dir (  @dirs  ) {
+            for my $ext (  @exts  ) {
+                for my $bin (  glob( "$dir/$pat$ext" )  ) {
+                    $bin =~ s-\\-/-g
+                        if  $IsWin;
+                    if(  -e $bin  &&  ! $bins{$bin}++  ) {
+                        if(  $gitdir  &&  $dir eq $gitdir  &&  $multi++  ) {
+                            $bin =~ s{^\Q$dir\E/}{};
+                        }
+                        push @bins, $bin;
+                    }
+                }
+            }
+        }
+    }
+    if(  ! @bins  ) {
+        local( $, )= ", ";
+        die "No executables matching ( @pats ) found.";
+    }
+    chdir( $gitdir )
+        if  $multi;
+    # `ls` can decide to sort the results alphabetically
+#   return
+#       if  0 == system( "ls", "-d", @bins );
+    print $_, $/
+        for @bins;
+}
+__END__
+[alias]
+#   hist = log --format=format:%H
+    staged = diff --cached
+    what = log -n 1 "--pretty=format:%h %d\n"
+    ns = numstat
+    local $/ = "\0";
+    qx( git config --null -l )
+    local $/ = "\0";
+    my @aka = grep /^alias\./, qx( git config --null -l )
+    $\ = "\n\n"; local $/ = "\0"; qx( git config --null -l )
+
+    my @aka = do {
+        local $/ = "\0";
+        grep /^alias\./, qx( git config --null -l );
+    };
+    s/^alias\.//, s/\n.*//
+        for @aka;
+    @aka

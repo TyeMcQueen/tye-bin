@@ -1,0 +1,142 @@
+#!/usr/bin/perl -w
+use strict;
+
+use File::Spec();
+use Getopt::Long();
+
+# git-spork should be alias for:
+# git distance upstream/master origin/master master @{u} HEAD
+
+Main( @ARGV );
+exit;
+
+
+sub Usage {
+    my( @msg ) = @_;
+    if(  @msg  ) {
+        warn @msg, $/;
+    }
+    warn "Usage: git-distance commit1 c2 [...] [ - c3 c4 [...] ]\n";
+    if(  @msg  ) {
+        warn join "\n",
+            "Run 'git-distance' (no arguments) for more info.",
+        '';
+        exit( 1 );
+    }
+    warn sprintf "    %s\n", join "\n    ",
+       'Shows how many commits are missing or added between pairs of commits.',
+       '"^" lines count commits that are in the upper commit, not the lower.',
+       '"v" lines count commits that are in the lower commit, not the upper.',
+       'Example:',
+       '    $ git distance up/master origin/master master @{u} HEAD - master HEAD',
+       '    up/master',
+       '      = same commit =',
+       '    origin/master',
+       '      ^   61 commits,    5 merges ^',
+       '    master',
+       '      ^   17 commits,    2 merges ^',
+       '      v    8 commits,   no merges v',
+       '    origin/new-feature (@{u})',
+       '      v   12 commits,   no merges v',
+       '    new-feature (HEAD)',
+       '',
+       '    master',
+       '      ^   17 commits,    2 merges ^',
+       '      v   20 commits,   no merges v',
+       '    new-feature (HEAD)',
+       '    $',
+       'Indicating you have 61 commits to pull from origin/master, that master',
+       'and your branch have diverged, and you have 12 commits to push to @{u}.',
+       'Notice how "-" can be passed to break up the list.',
+    ;
+    exit( 0 );
+}
+
+
+sub CommitName {
+    my( $spec ) = @_;
+    my $name = qx[ git rev-parse --symbolic-full-name '$spec' 2>&1 ];
+    if(  $?  ) {
+        my $sha = qx[ git rev-parse --revs-only '$spec' 2>&1 ];
+        return "$spec is not a commit!"
+            if  $?  ||  $sha !~ /\S/;
+        return $spec;
+    }
+    chomp $name;
+    return $spec
+        if  $name =~ m{(^|/)\Q$spec\E$};
+    s{^refs/(heads|remotes)/}{}
+        for $name;
+    return "$name ($spec)";
+}
+
+
+sub CountCommits {
+    my( $from, $to, $opts ) = @_;
+    $opts ||= "";
+    return 0 + qx[ git log --oneline $opts $from..$to | wc -l ];
+}
+
+
+sub Vector {
+    my( $from, $to ) = @_;
+    my $c = CountCommits( $from, $to );
+    return ''
+        if  0 == $c;
+    my $m = CountCommits( $from, $to, '--merges' );
+    $m ||= "no";
+    return sprintf "%4d commmits, %4s merges", $c, $m;
+}
+
+
+sub DistanceBetween {
+    my( $from, $to ) = @_;
+    my $sub = Vector( $to, $from );
+    $sub &&= "  ^ $sub ^\n";
+    my $add = Vector( $from, $to );
+    $add &&= "  v $add v\n";
+    return "  = same commit =\n"
+        if  ! $sub  &&  ! $add;
+    return $sub, $add;
+}
+
+
+sub ShowDistance {
+    my( @commits ) = @_;
+    warn "Can't measure distance with a single commit (@commits).\n"
+        if  1 == @commits;
+    my $disp = CommitName( $commits[0] );
+    for my $i ( 1..$#commits ) {
+        print $disp, $/;
+        my $skip = $disp =~ /not a commit!/;
+        $disp = CommitName( $commits[$i] );
+        $skip ||= $disp =~ /not a commit!/;
+        print DistanceBetween( @commits[ $i-1, $i ] )
+            if  ! $skip;
+    }
+    print $disp, $/;
+}
+
+
+sub Main {
+    my( @commits ) = @_;
+    Usage()
+        if  ! @commits;
+    Usage("Unrecognized option ($commits[0]).")
+        if  $commits[0] =~ /^-./;
+    Usage("Can't measure distance between a single commit.")
+        if  @commits < 2;
+    my @list;
+    for my $commit ( @commits ) {
+        if( "-" eq $commit ) {
+            ShowDistance(@list)
+                if  @list;
+            print $/;
+            @list = ();
+        } else {
+            push @list, $commit;
+        }
+    }
+    ShowDistance(@list)
+        if  @list;
+}

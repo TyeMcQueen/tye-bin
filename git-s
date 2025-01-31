@@ -1,0 +1,140 @@
+#!/bin/bash
+
+gitdir="$( git rev-parse --git-dir )"
+state="$( git state )"
+
+if [[  $state == rebase-*  ]]; then
+    if [[  $state == rebase-i*  ]]; then
+        echo "# *** In the middle of 'git-rebase -i' !"
+    else
+        echo "# *** In the middle of 'git-rebase -m' !"
+    fi
+    branch="$( cat $gitdir/rebase-merge/head-name )"
+    branch="${branch##*/}"
+    echo "# (Run 'git rebase --continue' or --abort?)"
+    echo "# (You'll eventually get back to branch $branch)"
+elif [[  $state == rebase/am  ]]; then
+    echo "# *** Rebasing or git-am'ing, maybe ?!"
+elif [[  $state == rebase*  ]]; then
+    echo "# *** In the middle of git-rebase !"
+    echo "# (Run 'git rebase --continue' or --abort?)"
+elif [[  $state == am*  ]]; then
+    echo "# *** In the middle of git-am !"
+    echo "# (Run 'git am --continue' or --abort?)"
+elif [[  $state == bisect*  ]]; then
+    echo "# *** In the middle of git-bisect !"
+    echo "# (Run 'git bisect reset'?)"
+fi
+
+if [[  $state == *merge*  ]]; then
+    if [[  $state == merge*  ]]; then
+        echo "# *** In the middle of merging !"
+    else
+        echo "# *** Also in the middle of merging !"
+    fi
+    echo "# (Run 'git commit'?)"
+fi
+
+head=$( git symbolic-ref HEAD 2>/dev/null )
+head="${head#refs/heads/}"
+if [[  -z $head  ]]; then
+    desc="$( git describe --all \
+        | perl -lpe 's/^(.*)-([0-9]+)-g[0-9a-f]{7,}$/$1 +$2/' )"
+    echo "# Not on any branch !${desc+ ($desc)}"
+##  This is slow.  Move it to a separate command:
+#   set -- $( git for-each-ref --format="%(refname)" "refs/remotes/origin/*" \
+#     | xargs -i git rev-count {} HEAD \
+#     | sort -n --key=3.3 --key=2.3 | head -1 )
+#   befref="${1##*/}"
+#   befadd=$2
+#   befsub=$3
+#   if [[  '+0-0' == "$befadd$befsub"  ]]; then
+#       echo "# HEAD currently matches branch $befref"
+#   else
+#       set -- $( git for-each-ref --format="%(refname)" "refs/remotes/origin/*" \
+#         | xargs -i git rev-count HEAD {} \
+#         | sort -n --key=3.3 --key=2.3 | head -1 )
+#       aftadd=$2
+#       aftsub=$3
+#       aftref="${4##*/}"
+#       if [[  $befref == $aftref  ]]; then
+#           echo "# ( $befref $befadd $befsub HEAD )"
+#       else
+#           echo "# ( $befref $befadd $befsub HEAD $aftadd $aftsub $aftref )"
+#       fi
+#   fi
+else
+    repo=$( git config "branch.$head.remote" )
+    branch=$( git config "branch.$head.merge" )
+    branch="${branch#refs/heads/}"
+    if [[  -z $repo  ||  -z $branch  ]]; then
+        echo "# On branch $head (not tracking!)"
+    else
+        if [[  $head == $branch  ]]; then
+            echo "# On branch $head, tracking $repo/*"
+        else
+            echo "# On branch $head, tracking $repo/$branch !"
+        fi
+        if [[  -z $( git for-each-ref "refs/remotes/$repo/$branch" )  ]]; then
+            echo "# Tracking branch does not exist !"
+        else
+            remote="$repo/$branch" #                        v strip spaces
+            pull=$( git rev-list "$head..$remote" | wc -l | xargs echo )
+            push=$( git rev-list "$remote..$head" | wc -l | xargs echo )
+            if [[  0 == $pull  ]]; then
+                if [[  0 == $push  ]]; then
+                    echo "# (In sync with tracking branch.)"
+                else
+                    echo -n "# You have $push commits yet to push"
+                    echo " (use: git push $repo HEAD)"
+                fi
+            else
+                if [[  0 == $push  ]]; then
+                    echo -n "# There are $pull commits to be pulled"
+                    echo " (use: git pull --ff-only)"
+                else
+                    echo "# With $pull commits to pull and $push to push !"
+                    merges=$( git rev-list --merges "$remote..$head" | wc -l )
+                    if [[  0 == $merges  ]]; then
+                        echo "# (use: git pull --rebase) No local merges"
+                    else
+                        echo "# (use: git pull) There are $merges local merges"
+                    fi
+                fi
+            fi
+        fi
+    fi
+fi
+
+conflicted=
+git status --porcelain | egrep '^(AA|DD|U|.U)' | while read; do
+    [[ -z $conflicted ]] && \
+        echo "# Merge conflicts left to resolve (run 'git mergetool'?):"
+    conflicted=1
+    file="${REPLY#?? }"
+    case "$REPLY" in
+        AA*)    echo "    $file (both added)";;
+        DD*)    echo "    $file (both deleted)";;
+        UU*)    echo "    $file (both modified)";;
+        AU*)    echo "    $file (added here)";;
+        UA*)    echo "    $file (added there)";;
+        DU*)    echo "    $file (deleted here)";;
+        UD*)    echo "    $file (deleted there)";;
+        *)      echo "    $file (WTF)";;
+    esac
+done
+
+echo "# Changes staged to be committed:"
+git diff --cached --numstat | git ns -
+
+echo "# Changes not staged in working tree:"
+git diff --numstat | git ns -
+
+echo "# Untracked files touched within 14 days:"
+# TODO: Incorrectly hides new files in new subdirs
+git status --porcelain | perl -nl \
+  -e 'print "    $_" if s/^[?][?] // && ( -M $_ < 14 || !++$m );' \
+  -e 'END { print "    (plus $m others)" if $m }'
+
+# On branch topic-api-cte-create
+# Your branch is behind 'origin/topic-api-cte-create' by 20 commits, and can be fast-forwarded.

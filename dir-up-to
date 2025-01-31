@@ -1,0 +1,57 @@
+#!/usr/bin/perl -w
+use strict;
+
+Main( @ARGV );
+exit 0;
+
+sub Main {
+    my( $pwd, $want ) = @_;
+    if( 2 != @_ ) {
+        die 'Usage: cd "$( dir-up-to "$PWD" ${1+"$@"} )"', $/;
+    }
+
+    my @pwd = split '/', $pwd;
+    if( -e $want || $want eq $pwd[-1] ) {
+        if( chdir($pwd) ) {
+            print "$pwd\n";
+            return;
+        }
+    }
+    my $rel = "";   # Use '-e $want' not '-e "$d/$want"' for now.
+    while( @pwd ) {
+        if( ! -d ".." ) {   # In a deleted directory:
+            $rel = "x"; # Use '-e "$d/$want"' until we can chdir() again.
+            while( @pwd ) {
+                my $d = join( "/", @pwd );
+                if( -d $d ) {
+                    if( chdir($d) ) {
+                        $rel = "";  # Use '-e $want' again.
+                        last;
+                    }
+                    warn "Can't 'cd $d' out of deleted dir: $!\n";
+                }
+                pop @pwd;
+            }
+            last
+                if  ! @pwd;
+        }
+
+        my $d = join( "/", @pwd );
+        $rel &&= "$d/";
+        if(  "" eq $want  ||  $want eq $pwd[-1]  ||  -e "$rel$want"  ) {
+            if(  ! $rel  ||  chdir($d)  ) {
+                print "$d\n";
+                return;
+            }
+            warn "Can't 'cd $d'",
+                "" eq $want ? "" : " (found $want)", ": $!\n";
+            $rel = "x"; # Use '-e "$d/$want"' until we can chdir() again.
+        }
+        pop @pwd;
+        chdir("..")
+            or  warn "Can't 'cd ..': $!\n";
+    }
+    print "/\n"
+        if  ! @pwd;
+}
+

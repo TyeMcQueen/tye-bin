@@ -1,0 +1,889 @@
+#!/usr/bin/perl -w
+use strict;
+
+use File::Spec();
+use Getopt::Long();
+
+my $IA      = 0;    # Whether to prompt for what to do next
+my $Gui     = 0;    # Whether to run gvim instead of vim
+my $Commit  = 0;    # Whether to run git-commit after git-add
+my $Amend   = 0;    # Whether to run "git-commit -a" after git-add
+my $Repeat  = 0;    # Whether to iterate until all changes committed
+my %TempFile;       # Files to be (re)moved when finished
+my @Patterns;       # List of file patterns to restrict what we look at
+my $ModUn   = '';   # Which types of files last listed; "m", "u", or "mu"
+
+my $AbortFile = ".git/StopAddVD";
+
+
+Main( @ARGV );
+exit;
+
+#TODO:
+#   Bug usage case:
+#       Added a bunch of changes via 'git-add1vd -rc'.
+#       Aborted commit.
+#       Said 'no' to un-add-ing.
+#       Quit all subsequent edit sessions.
+#       git-add1vd quit
+#       The *.ADD files got deleted !!!
+#       Used 'git-reset -p' to un-add some of the changes.
+#       At this point, I expected the *.ADD files to still be recording those.
+#       Used 'git-commit --amend' to fold still-added changes into prior commit.
+#       Ran 'git-add1vd -rc' again.
+#   Need a way to exit git-add1vd, keeping the *.ADD files.
+#   At start, should save change into a stash, pop stash, log stash SHA to
+#       hidden file.
+#   Better automatic handling of new files
+
+sub Usage {
+    my( @msg ) = @_;
+    if(  @msg  ) {
+        warn @msg, "\n";
+    }
+    warn "Usage: git-add1vd [-gimucar] [ {File|Pattern} [...] ]\n",
+         "   or: git-add1vd {-q|--quit}\n";
+    if(  @msg  ) {
+        warn join "\n",
+            'Options:  [-g|--gui] [-m|--modified] [-c|--commit] [-r|--repeat]',
+            "Run 'git-add1vd -h' for more info.",
+        '';
+        exit( 1 );
+    }
+    warn sprintf "    %s\n", join "\n    ",
+       'Runs vimdiff comparing:',
+       '        The version of File from the index (on the left, as File-ADD)',
+       '   and  The version of File from the working tree (on the right).',
+       'Move some differences to left from right and save (to File-ADD)',
+       'then exit and those changes are staged (like "git-add -p").',
+       'Options:',
+       '    --gui       Run gvimdiff instead of vimdiff',
+       '    --modified  Include (all|matching) modified files',
+       '    --untracked Add (all|matching) untracked files',
+       '    --commit    After adding, restart vim for you to compose',
+       '                a commit message.  The total staged diff is',
+       '                included as a comment so you can review it.',
+       '    --repeat    After commit, start over until all changes',
+       '                have been committed.  Ignored if no --commit.',
+       '    --quit      Just stop after the current vimdiff exits.',
+       'If more than one File is listed/found, then each git-add step will',
+       'cycle through each of the files listed.',
+    ;
+    exit( 0 );
+}
+
+
+sub END {
+    for(  1 .. 3  ) {
+        for my $file (  sort keys %TempFile  ) {
+            my $orig = $TempFile{$file};
+            next
+                if  $orig  &&  exists $TempFile{$orig}
+                ||  ' fail ' eq $orig;
+            delete $TempFile{$file};
+            my $done;
+            if(  ! $orig  ) {
+                LOG( "END$_: Deleting", $file );
+                $done = unlink( $file )
+                    or  warn "Failed to delete temp $file: $!\n";
+            } else {
+                LOG( "END$_: Renaming back", $file, $orig );
+                $done = rename( $file, $orig )
+                    or  warn "Failed to restore $file to $orig: $!\n";
+            }
+            $TempFile{$file} = ' fail '
+                if  ! $done;
+        }
+    }
+    for my $file (  sort keys %TempFile  ) {
+        my $orig = $TempFile{$file};
+        next
+            if  ' fail ' eq $orig;
+        if( $orig ) {
+            warn "Won't try to restore $file to (remaining) $orig.\n";
+        } else {
+            warn "WTF? Increase above loop count to more than 3 ($file)";
+        }
+    }
+}
+
+
+sub Rename {
+    my( $from, $to ) = @_;
+    die "Bug? Won't try to overwrite $to with $from.\n"
+        if  -e $to;
+    rename( $from, $to )
+        or  die "Couldn't rename $from to $to: $!\n";
+    my $origName = delete $TempFile{$from};
+    if(  ! defined $origName  ) {
+        LOG( "1st rename", $from, $to );
+        $TempFile{$to} = $from;     # First time renaming this file
+    } elsif(  ! $origName  ) {
+        LOG( "Temp rename", $from, $to );
+        $TempFile{$to} = '';        # Still just a temp file, but with new name
+    } elsif(  $to ne $origName  ) {
+        LOG( "2nd rename", $from, $to, $origName );
+        $TempFile{$to} = $origName; # Given yet another name
+    } else {
+        LOG( "Restored", $from, $to );
+    }
+}
+
+
+sub Delete {
+    my( $file ) = @_;
+    if(  $TempFile{$file}  ) {
+        warn "Weird, deleting $file, not restoring to $TempFile{$file}\n";
+    }
+    LOG( "Deleting", $file, $TempFile{$file} );
+    if(  unlink( $file )  ) {
+        delete $TempFile{$file};
+    } else {
+        warn "Failed to delete $file: $!\n";
+        $TempFile{$file} = ' fail '
+            if  exists $TempFile{$file};
+    }
+}
+
+
+sub TempFile {
+    my( $file, $create ) = @_;
+    if(  $TempFile{$file}  ) {
+        croak( "Tried to claim temp file ($file) from: $TempFile{$file}\n" );
+    } elsif(  defined $TempFile{$file}  ) {
+        warn "Weird, temp file $file was already marked as temporary.\n";
+    }
+    if(  ! -e $file  ) {
+        die "Tried to claim non-existant temporary file: $file\n"
+            if  ! $create;
+        if(  open TOUCH, '>', $file  ) {
+            close TOUCH;
+        } else {
+            die "Failed to touch temp file, $file: $!\n";
+        }
+    } elsif(  $create  ) {
+        die "Asked to create temp file that already exists: $file\n";
+    }
+    $TempFile{$file} = '';
+}
+
+
+sub AbortCurrent {
+    my( $doAbort ) = @_;
+    our $GitRoot ||= join '/',
+        qx[ git rev-parse --show-toplevel ],
+        $AbortFile;
+    if( $doAbort ) {
+        open my $fh, '>', $AbortFile
+            or  die "Can't create $AbortFile: $!\n";
+        warn "Will abort git-add1vd after editor exits.\n";
+        exit;
+    }
+    return 0
+        if  ! -e $AbortFile;
+    unlink( $AbortFile )
+        or  warn "Can't delete $AbortFile: $!\n";
+    warn "Aborting (somebody ran 'git-add1vd --quit').\n";
+    return 1;
+}
+
+
+sub FindFiles {
+    my( $warn, $modified, $untracked, @pats ) = @_;
+    my @files;
+    chomp( my $base = qx[ git rev-parse --show-cdup ] );
+    if( ! @pats ) {
+        @pats = $base;
+    }
+    for( @pats ) {
+        $_ = $base
+            if  '/' eq $_;
+        # Symlinks could be useful as short-hand for some deep subdir
+        if( $_ ) {
+            my %linked;
+            while( -l $_ ) {
+                my $l = readlink $_;
+                $_ = $l =~ m{^/} ? $l : "$_/$l";
+                die "Symlink loop: $_"
+                    if  $linked{$_}++;
+                die "Symlink labyrinth: $_"
+                    if  20 < keys %linked;
+            }
+            die "Not a file, directory, nor pattern: $_\n"
+                if  ! -d _  &&  ! -e _  &&  ! /[\[*?]/;
+        } else {
+            $_ = '.';
+        }
+        my $regex =
+            ! $modified ? '[?][?]' : ! $untracked ? '[^R]M' : '[^R][M?]';
+        my @found = map /^$regex (.*)/, qx[ git relstat '$_' ];
+        my $what = join "/",
+            $modified ? 'modified' : (), $untracked ? 'untracked' : ();
+        $ModUn = join "", $modified ? 'm' : '', $untracked ? 'u' : '';
+        warn "No $what files found", $_ ? " matching $_" : '', ".\n"
+            if  ! @found;
+        for(  @found  ) {
+            if(  ! -d $_  ) {
+                push @files, $_;
+            } elsif(  $warn  ) {
+                warn "Skipping untracked subdir, $_.\n";
+            }
+        }
+    }
+    my %seen;
+    return grep ! $seen{$_}++, @files;
+}
+
+
+sub CmdLineOpts {
+    local( @ARGV ) = @_;
+    Getopt::Long::Configure( 'bundling' );
+    Getopt::Long::GetOptions(
+        'i'             => \$IA,
+        'g|gui'         => \$Gui,
+        'm|modified'    => \( my $modified = 0 ),
+        'u|untracked'   => \( my $untracked = 0 ),
+        'c|commit'      => \$Commit,
+        'a|amend'       => \$Amend,
+        'r|repeat'      => \$Repeat,
+        'h|help'        => sub { Usage() },
+        'q|quit'        => sub { AbortCurrent(1) },
+    )   or  Usage();
+    if(  $modified  ||  $untracked  ) {
+        @Patterns = @ARGV;
+        @ARGV = FindFiles( 1, $modified, $untracked, @Patterns );
+        exit 1              # Failure reason given by FindFiles() via warn().
+            if  ! @ARGV;
+    }
+    Usage( "No files (nor -m nor -u) specified" )
+        if  ! @ARGV;
+    CheckFile( $_ )
+        for @ARGV;
+    if(  $IA  ) {
+        warn "Ignoring --repeat since -i given.\n"
+            if  $Repeat;
+        warn "Ignoring --commit since -i given.\n"
+            if  $Commit;
+        warn "Ignoring --amend since -i given.\n"
+            if  $Amend;
+        $Repeat = $Commit = $Amend = 0;
+    }
+    $Commit = 1
+        if  $Amend;
+    if(  $Repeat  &&  ! $Commit  ) {
+        warn "Ignoring --repeat since no --commit given.\n";
+        $Repeat = 0;
+    }
+    return @ARGV;
+}
+
+
+sub Changed {
+    my( $file ) = @_;
+    my $diff = qx[ git relstat '$file' 2>&1 ];
+    die "git-relstat failed: $diff"
+        if  $?;
+    return "M"
+        if  $diff =~ /^[^R]M/;
+    return "U"
+        if  $diff =~ /^[?][?]/;
+    return "";
+}
+
+
+sub CheckFile {
+    my( $file, $initial ) = @_;
+    my $isFile = -f $file;
+    die "Can't stat $file: $!\n"
+        if  ! defined $isFile;
+    die "Not a plain file: $file\n"
+        if  ! $isFile;
+    # Doing qx// with weird characters in filenames is a pain:
+    die "Weird character ($1) in file name ($file); just giving up.\n"
+        if  $file =~ m{([^-+./0-9A-Z_a-z ])};
+    if(  $initial  &&  -f "$file-ADD"  ) {
+        Delete("$file-ADD")
+            if  YesNo(
+                    "$file-ADD exists.\n", "Reset *-ADD to match index?",
+                    sub { die "Read EOF.\n" },
+                );
+    }
+    my $changed = Changed( $file );
+    warn "There are no (unstaged) changes in $file\n"
+        if  ! $changed  &&  $initial;
+    return $changed;
+}
+
+
+sub EditDiff {
+    my( $file ) = @_;
+    my $vim = $ENV{DIFFTOOL};
+    if(  ! $vim  ) {
+        $vim = "vim -d";
+        $vim = "gvim -f -d"
+            if  $Gui;
+    } elsif(  $Gui  ) {
+        my $alt = $ENV{GDIFFTOOL};
+        $vim = $alt
+            if  $alt;
+    }
+    system( qq[ $vim '$file-ADD' '$file' ] );
+    return $vim     # Return name of command that failed.
+        if  0 != $?;
+    return '';      # Nothing failed.
+}
+
+
+sub CopyMode {
+    my( $from, $to ) = @_;
+    my $mode = ( stat $from )[2]
+        or  return;
+    chmod $mode, $to
+        or  warn "Can't set file-mode on $to: $!\n";
+}
+
+
+sub YesNo {
+    my( $intro, $prompt, $death ) = @_;
+    print STDERR "$intro $prompt ";
+    while(  1  ) {
+        my $resp = <STDIN> || ''
+            or  $death->();
+        return 0
+            if  $resp =~ /^\s*n/i;
+        return 1
+            if  $resp =~ /^\s*y/i;
+        print STDERR "('y' or 'n') $prompt ";
+    }
+}
+
+
+sub StageChanges {
+    my( $file, $failed ) = @_;
+    Rename( $file, "$file-NEW" );
+    Rename( "$file-ADD", $file );
+    if(  ! Changed( $file )  ) {
+        warn "$failed failed and no changes had been saved.\n"
+            if  $failed;
+        return 0;
+    }
+    exit
+        if  $failed
+        &&  ! YesNo(
+                "$failed failed?", "Stage changes anyway?",
+                sub { die "Read EOF; not changes staged" },
+            );
+    System( qq[ git cat : '$file' > '$file-IDX' ] );
+    CopyMode( $file, "$file-IDX" );
+    LOG( "Created1", "$file-IDX", $TempFile{"$file-IDX"} );
+    TempFile( "$file-IDX" );
+    System( "git add '$file'" );
+    return 1;
+}
+
+
+sub CurrentBranch {
+    my $branch = qx[ git symbolic-ref HEAD 2>&1 ];
+    return ''
+        if  $?;
+    chomp $branch;
+    $branch =~ s{^refs/heads/}{};
+    return $branch;
+}
+
+
+sub CommitTemplate {
+    my $branch = CurrentBranch();
+    $branch = $branch ? "branch $branch" : "no branch";
+
+    #my $tmp = $ENV{TMPDIR} || $ENV{TMP} || $ENV{TEMP} || "/tmp";
+    #$tmp =~ s{\\}{/}g
+    #    if  $tmp =~ /^\w:/;
+
+    my $template = "commitvd.$$";
+    open TEMPLATE, '>', $template
+        or  die "Can't write $template: $!\n";
+    LOG( "Created2", $template, $TempFile{$template} );
+    TempFile( $template );
+    print TEMPLATE "\n\n#\n\n", join "\n",
+        "# Please enter the commit message for your changes. Lines starting",
+        "# with '#' will be ignored, and an empty message aborts everything.",
+        "# On $branch",
+    "\n";
+
+    open DIFF, "git diff --cached --numstat |"
+        or  die "Can't spawn git-diff: $!\n";
+    while(  <DIFF>  ) {
+        print TEMPLATE "# $_";
+    }
+    print TEMPLATE "\n";
+
+    open DIFF, "git diff --cached |"
+        or  die "Can't spawn git-diff: $!\n";
+    while(  <DIFF>  ) {
+        print TEMPLATE "#$_";
+    }
+    close DIFF;
+    close TEMPLATE;
+
+    return $template;
+}
+
+
+sub CommitMessage {
+    my $template = CommitTemplate();
+
+    my $vim = $ENV{VISUAL} || $ENV{EDITOR} || "vim";
+    if(  $Gui  &&  "vim" eq $vim  ) {
+        $vim = "gvim";
+    }
+    system( qq[ $vim $template ] );
+    open MSG, '<', $template
+        or  die "Can't read commit message from $template: $!\n";
+    my $msg = '';
+    my $skip = '';
+    for(  <MSG>  ) {
+        next
+            if  /^\s*#/;
+        if(  /^\s*$/  ) {
+            $skip = "\n"
+                if  $msg;
+        } else {
+            $msg .= $skip . $_;
+            $skip = '';
+        }
+    }
+    close MSG;
+    return $msg;      # Nothing failed.
+}
+
+
+sub CommitChanges {
+    my( @files ) = @_;  # TODO!!!
+
+    my $template = CommitTemplate();
+    my $amend = $Amend ? "--amend" : "";
+    # my $nil = File::Spec->devnull();
+    # system( "git commit $amend -e -t $nil -F $template --no-status" );
+    system( "git commit $amend -e -t $template --no-status" );
+
+    if( $? ) {
+        UnaddChanges( @files )
+            if  YesNo( "git-commit failed?",
+                    "Un-add recent changes?", sub { 0 } );
+        exit;
+    }
+    Delete( $_ )
+        for grep { exists $TempFile{$_} } map { "$_-IDX" } @files;
+}
+
+
+sub UnaddChanges {
+    my( @files ) = @_;
+    for my $file (  @files  ) {
+        Rename( $file, "$file-ADD" );
+        Rename( "$file-IDX", $file );
+        next
+            if  ! Changed( $file );
+        system( "git add '$file'" );
+        if(  $?  ) {    # git-add failed:
+            Delete( "$file-ADD" );  # This version is still in the index
+            # TODO: If $file-IDX is same as HEAD, just delete it
+            Rename( $file, "$file-IDX" );
+            LOG( "Preserving:", "$file-IDX", $TempFile{"$file-IDX"} );
+            delete $TempFile{"$file-IDX"};
+            warn "Your still-add-ed changes are excluded from $file-IDX.\n";
+        } else {
+            Delete( $file );        # This version is now in the index
+            # TODO: If $file-ADD is same as $file-NEW, just delete $file-ADD
+            LOG( "Preserving:", "$file-ADD", $TempFile{"$file-ADD"} );
+            delete $TempFile{"$file-ADD"};
+            warn "Your re-un-add-ed changes are saved in $file-ADD\n";
+        }
+        # At exit $file-NEW will be restored to $file
+    }
+}
+
+
+sub System {
+    my @args = @_;
+    $args[0]  =~ s/^\s+//;
+    $args[-1] =~ s/\s+$//;
+    print " ] @args ...\n";
+    system( @args );
+    die "$args[0] failed?\n"
+        if  $?;
+}
+
+
+sub EditFiles {
+    my( @files ) = @_;
+    for my $file (  @files  ) {
+        my $changed = CheckFile( $file );
+        if(  'U' eq $changed  ) {
+            Rename( $file, "$file-NEW" );
+            TempFile( $file, 1 );
+            CopyMode( "$file-NEW", $file );
+            System( "git add '$file'" );
+            Rename( $file, "$file-ADD" );
+            Rename( "$file-NEW", $file );
+        } else {
+            if(  -f "$file-ADD"  ) {
+                LOG( "Adopted3:", "$file-ADD", $TempFile{"$file-ADD"} );
+            } else {
+                System( qq[ git cat : '$file' > '$file-ADD' ] );
+                CopyMode( $file, "$file-ADD" );
+                LOG( "Created3:", "$file-ADD", $TempFile{"$file-ADD"} );
+            }
+            TempFile( "$file-ADD" )
+        }
+    }
+    my $changed = 0;
+    for my $file (  @files  ) {
+        my $failed = EditDiff( $file );
+        $changed++
+            if  StageChanges( $file, $failed );
+        last
+            if  AbortCurrent();
+    }
+    return $changed;
+}
+
+
+sub DetailedHelp {
+    my( $regex ) = @_;
+    my @help = (
+      'l                  show (L)ist of files again',
+      'l PATHSPEC [...]   (L)ist matching modified and untracked files',
+      'm [PATHSPEC [...]] list (M)odified files',
+      'u [PATHSPEC [...]] list (U)ntracked files',
+      'r                  (R)e-edit same file[s] to add more to index',
+      '[e] [RANGE [...]]  (E)dit listed file[s] to add more to index',
+      'p                  edit (P)revious file from list to add more to index',
+      'n                  edit (N)ext file from list to add more to index',
+      'i                  show (I)ndex contents in more detail',
+      'c                  (C)ommit index contents',
+      'a                  (A)mend index contents to previous commit',
+      's [MESSAGE]        (S)tash index contents',
+      'q                  (Q)uit',
+      'x                  e(X)it',
+    );
+    my $pathspec = 0;
+    my $range = 0;
+    for my $h (  @help  ) {
+        if(  $h =~ /^\[?$regex/  ) {
+            print $h, "\n";
+            $pathspec++
+                if  $h =~ /PATHSPEC/;
+            $range++
+                if  $h =~ /RANGE/;
+        }
+    }
+    print
+        "PATHSPEC matches files (see 'man 7 gitglossary' for details).\n",
+        "If no PATHSPECs are given, then the previous ones are used.\n"
+        if  $pathspec;
+    print
+        "RANGE is a number or a range like '2-6' or '3-' (all but 1, 2)\n",
+        "that selects files from the previously listed files.\n",
+        "Order of edit can be reversed with a range like '6-2' or '-3'.\n"
+        if  $range;
+}
+
+
+sub ShowHelp {
+    my( $op, $regex, $words ) = @_;
+    if(  $op =~ /^ *($regex|[*])/  ) {
+        $op = $1;
+        if(  '*' eq $op  ) {
+            DetailedHelp( '[a-z]' );
+        } elsif(  '?' eq $op  ) {
+            DetailedHelp( $regex );
+        } else {
+            DetailedHelp( $op );
+        }
+        return
+    }
+    print join( "\n",
+        "Type '?m' for help on the 'm' operation, '??' for extended help, or",
+        "'?*' for extended help including operations not currenctly available.",
+        "    $words",
+    '');
+}
+
+
+sub ParseRanges {
+    my( $count, $ranges ) = @_;
+    my @ranges = split /[, ]+/, $ranges;
+    my @nums;
+    for my $range (  @ranges  ) {
+        next
+            if  '' eq $range;
+        my $n = my( $a, $b ) = split '-', $range;
+        die "Too many '-' in range ($range).\n"
+            if  2 < $n;
+        my $over = 0;
+        for(  $a, $b  ) {
+            if(  $_  &&  $count < $_  ) {
+                $_ = $count;
+                $over++;
+            } elsif(  defined $_  &&  '0' eq $_  ) {
+                $_ = 1;
+                $over = -2;
+            }
+        }
+        if(  1 < $over  ) {
+            die "Ignoring out-of-bounds range ($range).\n";
+            next;
+        } elsif(  $over  ) {
+            warn "Truncated '$range' to '", defined $b ? "$a-$b" : $a, "'.\n";
+        }
+        if(  1 == $n  ) {
+            push @nums, $a;
+        } elsif(  '' eq $a  &&  '' eq $b  ) {
+            die "Range had no numbers ($range).\n";
+        } elsif(  '' eq $b  ) {
+            push @nums, $a .. $count;
+        } elsif(  '' eq $a  ) {
+            push @nums, reverse( $a .. $count );
+        } elsif(  $a <= $b  ) {
+            push @nums, $a .. $b;
+        } else {
+            push @nums, reverse( $a .. $b );
+        }
+    }
+    $_--
+        for @nums;
+    return @nums;
+}
+
+
+sub Prompt {
+    my( $count, @ops ) = @_;
+    my $regex = "[" . join("",@ops) . "?]";
+    my @any = qw<
+        List Modified Untracked Re-edit Edit Prev Next
+        Index Commit Amend Stash Quit Xit
+    >;
+    my @words = grep /^$regex/i, @any;
+    my $what = join ", ", @ops, "or ?";
+    my $op = '';
+    my @args;
+    while( '' eq $op ) {
+        print "Now what ($what): ";
+        chomp( $op = <STDIN> );
+        die "EOF reading from STDIN.\n"
+            if  ! defined $op;
+        if(  $op =~ /^[-0-9, ]+$/  ) {
+            $op = 'e ' . $op;
+        }
+        if(  $op !~ /^$regex/i  ) {
+            print
+                "Please enter one of the listed letters ",
+                "(maybe with extra args)\n    @words\n";
+            $op = '';
+        } elsif(  $op =~ /^[?]/  ) {
+            ShowHelp( substr($op,1), $regex, "@words" );
+            $op = '';
+        } elsif(  $op =~ /^e/  ) {
+            @args = ParseRanges( $count, substr($op,1) );
+            @args = 0 .. $count-1
+                if  ! @args;
+        } elsif(  $op =~ /^[lmu]/  ) {
+            ( $op, @args ) = ( substr($op,0,1), split ' ', substr($op,1) );
+        }
+    }
+    return lc(substr($op,0,1)), @args;
+}
+
+
+sub IndexSummary {
+    my( $detailed ) = @_;
+    my @diff = qx( git diff --cached --numstat --shortstat )
+        or  return '';
+    my $sum = pop @diff;
+    return "In index: $sum"
+        if  ! $detailed;
+    open NS, "|-", "git", "ns"
+        or  die "Can't fork() to run git-ns: $!\n";
+    for(  @diff  ) {
+        print NS $_;
+    }
+    close NS;
+}
+
+
+sub ColWidths {
+    my( $n, @items ) = @_;
+    my $rows = int( 1 + $#items / $n );
+    my $i = 0;
+    my @w;
+    for my $c (  1 .. $n  ) {
+        push @w, length($items[$i++]);
+        for my $r (  2 .. $rows  ) {
+            last
+                if  $#items <= $i;
+            my $l = length($items[$i++]);
+            $w[-1] = $l
+                if  $w[-1] < $l;
+        }
+    }
+    return @w;
+}
+
+
+sub PrintColumns {
+    my( @items ) = @_;
+    chomp( my $cols = qx< tput cols > || 80 );
+    my @w = ColWidths( 1, @items );
+    for my $n (  2 .. @items  ) {
+        my $w = 0;
+        $w += 2 + $_
+            for my @t = ColWidths( $n, @items );
+        last
+            if  $cols < $w;
+        @w = @t
+    }
+
+    my $rows = int( 1 + $#items / @w );
+    for(  0 .. $rows-1  ) {
+        my $sep = "";
+        for my $w (  @w  ) {
+            printf "$sep%*s", -$w, $items[$_];
+            $sep = "  ";
+            $_ += $rows;
+            last
+                if  $#items < $_;
+        }
+        print "\n";
+    }
+}
+
+
+sub List {
+    my( $pos, @files ) = @_;
+    my @items;
+    for my $i (  1 .. @files  ) {
+        my $p = '';
+        $p = 'p'
+            if  $i == $pos-1;
+        $p = 'n'
+            if  $i == $pos+1;
+        push @items, "$i$p. $files[$i-1]";
+    }
+    PrintColumns(@items);
+}
+
+
+sub StashIndex {
+    my( $message ) = @_;
+
+    if(  ! $message  ) {
+        return
+            if  not $message = CommitMessage();
+    }
+
+    System('git stash push -k -q -m "addvd step 1"');
+    System( qw< git stash push -m >, $message );
+    System('git stash pop --index -q stash@{2}');
+    System('git reset');
+    System('git sdiff -ndx 0 | git ns');
+}
+
+
+sub Interact {
+    my( @files ) = @_;
+    my $pos = 0;
+    List( $pos, @files );
+    my @last;
+    while( 1 ) {
+        print my $cached = IndexSummary();
+        my @ops = (
+            qw< l m u >,
+            @last ? 'r' : (),
+            ! @files ? () : (
+                'e', 1 < $pos ? 'p' : (), $pos < @files ? 'n' : () ),
+            $cached ? qw< i c a s > : (),
+            qw< q x >,
+        );
+        ( $_, my @args ) = Prompt( 0+@files, @ops );
+        if(  /[lmu]/  ) {
+            print "\n";
+            if(  /l/  &&  ! @args  ) {
+                List( $pos, @files );
+            } else {
+                @args = @Patterns
+                    if  ! @args;
+                if(  eval {
+                    @files = FindFiles( 0, !!/[lm]/, !!/[lu]/, @args ); 1
+                }  ) {
+                    @Patterns = @args;
+                    List( $pos = 0, @files );
+                } else {
+                    warn $@;
+                }
+            }
+        } elsif(  /r/  ) {
+            EditFiles( @last );
+        } elsif(  /e/  ) {
+            EditFiles( @last = @files[@args] );
+        } elsif(  /p/  ) {
+            EditFiles( @last = $files[--$pos-1] );
+        } elsif(  /n/  ) {
+            EditFiles( @last = $files[++$pos-1] );
+        } elsif(  /i/  ) {
+            IndexSummary( 1 );
+        } elsif(  /[ca]/  ) {
+            $Amend = /a/;
+            CommitChanges( @files );
+        } elsif(  /s/  ) {
+            StashIndex();
+        } elsif(  /[qx]/  ) {
+            return;
+        } else {
+            die "Impossible operation ($_).\n";
+        }
+    }
+}
+
+
+sub LOG {
+    return
+        if  ! $ENV{TRACE};
+
+    require JSON::XS;
+    our $JSON;
+    if(  ! $JSON  ) {
+        $JSON = JSON::XS->new();
+        # $JSON->utf8(1);
+        # $JSON->allow_nonref();
+    }
+
+    print STDERR $JSON->encode(\@_), "\n";
+}
+
+
+sub Main {
+    my( @files ) = CmdLineOpts( @_ );
+    if(  $IA  ) {
+        Interact( @files );
+    } else {
+        while( @files ) {
+            last
+                if  ! EditFiles( @files );
+            CommitChanges( @files )
+                if  $Commit;
+            last
+                if  ! $Repeat;
+            # Stop looping through files that have no changes left:
+            @files = grep {
+                Rename( $_, "$_-ADD" );
+                Rename( "$_-NEW", $_ );
+                CheckFile( $_ );
+            } @files;
+        }
+    }
+}
+
+
+__END__

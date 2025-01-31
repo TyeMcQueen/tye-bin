@@ -1,0 +1,211 @@
+#!/usr/bin/perl -w
+use strict;
+
+use File::Temp  qw< tempfile >;
+
+# Turn "git diff" output into something "vimdiff" can display
+
+# TODO:
+#   Allow git-gvdiff to background itself (perhaps by default)
+#   In case of add/rename/del, fix "path" line to be same on both sides
+
+Main( @ARGV );
+exit;
+
+sub Usage {
+    die join "\n",
+        'Usage: git [g]vdiff [-opts] [$COMMIT1 [$COMMIT2]] [--] [$PATH...]',
+    '';
+}
+
+sub IsCommit {
+    my( $arg ) = @_;
+    return 1
+        if  $arg =~ /^:0?$|^[~^]/;
+    die "Commit of ':[123]' not supported (yet?).\n"
+        if  $arg =~ /^:[123]$/;
+    my $name = qx{ git name-rev "\Q$arg\E" 2>/dev/null };
+    return 1
+        if  $name;
+    return 0;
+}
+
+sub SplitArgs {
+    my( @args ) = @_;
+    my( @opts, @commits );
+    while( @args ) {
+        my $arg = $args[0];
+        last
+            if  '--' eq $arg;
+        if(  $arg =~ /^--?[^-]/  ) {
+            push @opts, @commits, $arg;
+            @commits = ();
+        } else {
+            push @commits, $arg;
+        }
+        shift @args;
+    }
+    my @paths;
+    if(  @args  ) {
+        @paths = @args;
+    } elsif(  ! @commits  ) {
+        ;
+    } elsif(  $commits[0] =~ /[.]{2,3}/  ) {
+        my $pair = shift @commits;
+        @paths = @commits;
+        @commits = split /[.]{2,3}/, $pair, 2;
+        s/^$/HEAD/
+            for @commits;
+    } else {
+        @paths = @commits;
+        @commits = ();
+        while(  @paths  &&  @commits < 2  ) {
+            my $arg = $paths[0];
+            my $isCommit = IsCommit($arg);
+            my $isPath = -e $arg;
+            if(  $isCommit  &&  ! $isPath  ) {
+                push @commits, $arg;
+                shift @paths;
+            } elsif(  ! $isCommit  &&  $isPath  ) {
+                last;
+            } else {
+                my $type = $isCommit && $isPath ? "Ambiguous" : "Unrecognized";
+                die "$type argument ($arg);",
+                    " put '--' after commits and before paths.\n";
+            }
+        }
+    }
+
+    return \( @opts, @commits, @paths );
+}
+
+sub CleanOpts {
+    my( $opts_aref, $commits_aref ) = @_;
+    my @opts = @$opts_aref;
+    my @commits = @$commits_aref;
+
+    # Fill in the default commits:
+    my $staged = grep /^--cached$/, @opts
+        and do {
+            @opts = grep ! /^--cached$/, @opts;
+        };
+    @commits = $staged ? ( "HEAD", ":" ) : ( ":", "/" )
+        if  ! @commits;
+    push @commits, $staged ? ":" : "/"
+        if  1 == @commits;
+    if(  grep /^-R$/, @opts  ) {
+        @commits = reverse @commits;
+        @opts = grep ! /^-R$/, @opts;
+    }
+
+    s/^:0?$/:/, s{^[.]$}{/}     # :0 means :, . means /
+        for @commits;
+
+    for my $c ( 0, 1 ) {
+        $commits[$c] = $commits[1-$c] . $commits[$c]
+            if  $commits[$c] =~ /^[~^]/;
+    }
+
+    # Convert pair of commits into git-diff arguments:
+    if(  ": /" eq "@commits"  ) {
+        ;                                           # :../
+    } elsif(  "/ :" eq "@commits"  ) {
+        push @opts, '-R';                           # /..:  -R
+    } elsif(  "/" eq $commits[1]  ) {
+        push @opts, $commits[0];                    # $C../ $C
+    } elsif(  "/" eq $commits[0]  ) {
+        push @opts, '-R', $commits[1];              # /..$C -R $C
+    } elsif(  ":" eq $commits[1]  ) {
+        push @opts, '--cached', $commits[0];        # $C..: --cached $C
+    } elsif(  ":" eq $commits[1]  ) {
+        push @opts, '--cached', '-R', $commits[0];  # :..$C --cached -R $C
+    } else {
+        push @opts, join "..", @commits;
+    }
+
+    s/^:$/: (index)/, s{^/$}{/ (working tree)}  # Add decriptions for headers
+        for @commits;
+
+    push @opts, '--no-color'                # Always "on"
+        if  ! grep /^--no-color$/, @opts;
+    if(  grep /^--no-patience$/, @opts  ) {
+        @opts = grep ! /^--no-patience$/, @opts;
+    } elsif(  ! grep /^--patience$/, @opts  ) {
+        push @opts, '--patience';           # "On" by default
+    }
+
+    @$opts_aref = @opts;
+    @$commits_aref = @commits;
+    return;
+}
+
+sub SplitDiff {
+    my( $in, $fh1, $commit1, $fh2, $commit2 ) = @_;
+    print $fh1 "$commit1\n";
+    print $fh2 "$commit2\n";
+    while(  <$in>  ) {
+        if(  /^diff /  ) {
+            print $fh1 "\n";
+            print $fh2 "\n";
+        } elsif(  /^index \w+\.\.\w+( \w+)?$/  ) {
+            ;
+        } elsif(  s/^old |^deleted file //  ) {
+            print $fh1 $_;
+        } elsif(  s/^new (file )?//  ) {
+            print $fh2 $_;
+        } elsif(  /^\w+ from /  ) {
+            print $fh1 $_;
+        } elsif(  /^\w+ to /  ) {
+            print $fh2 $_;
+        } elsif(  m{^--- (\w/)?(.*)}  ) {
+            print $fh1 "path $2\n";
+        } elsif(  m{^\+\+\+ (\w/)?(.*)}  ) {
+            print $fh2 "path $2\n";
+        } elsif(  /^\@\@/  ) {
+            print $fh1 $_;
+            print $fh2 $_;
+        } elsif(  s/^-//  ) {
+            print $fh1 $_;
+        } elsif(  s/^\+//  ) {
+            print $fh2 $_;
+        } elsif(  s/^ //  ) {
+            print $fh1 $_;
+            print $fh2 $_;
+        } else {
+            print $fh1 "?? $_";
+            print $fh2 "?? $_";
+        }
+    }
+}
+
+sub ReadCmd {
+    my( $cmd, @args ) = @_;
+    open my $fh, "-|", $cmd, @args
+        or  die "Can't fork to run $cmd: $!\n";
+    return $fh;
+}
+
+sub Main {
+    my( @args ) = @ARGV;
+    my( $opts, $commits, $paths ) = SplitArgs( @args );
+    CleanOpts( $opts, $commits );
+    my $in = ReadCmd( 'git', 'diff', @$opts, @$paths );
+    my $cmd = join ' ', 'git', 'diff', @$opts, @$paths;
+    my @templates = @$commits;
+    s/^.*[ (](\w+)\)$/$1/, s/\W+/_/g, s/$/.XXXXX/
+        for @templates;
+    my( $fh1, $file1 ) = tempfile( $templates[0], TMPDIR => 1 );
+    my( $fh2, $file2 ) = tempfile( $templates[1], TMPDIR => 1 );
+    print $_ "ran: $cmd\n"
+        for $fh1, $fh2;
+    SplitDiff( $in, $fh1, $commits->[0], $fh2, $commits->[1] );
+    close $fh1;
+    close $fh2;
+    my @editor = ( "vim", "-d" );
+    @editor = ( "gvim", "-f", "-d" )
+        if  $0 =~ /git-gvdiff/;
+    system( @editor, $file1, $file2 );
+    unlink( $file1, $file2 );
+}
+
+__END__

@@ -1,0 +1,231 @@
+#!/bin/bash
+
+fake=
+stashed=
+aborting=
+onlyup=true
+
+run() {
+    echo " > $*"
+    $fake "$@" && return
+    [[ $aborting ]] && return
+    [[ "$*" = "git rebase "* ]] && return
+    echo -n "Try to (and need to) fix ? "
+    resp=y
+    while [[  $resp != n*  ]]; do
+        if  ! read resp;  then
+            abort_rebase
+        elif [[  $resp != n*  ]]; then
+            spawn_shell
+            echo -n "Try more fixing ? "
+        fi
+    done
+    return 1
+}
+
+abort_rebase() {
+    echo "" >&2
+    echo "Aborting rebase (due to end-of-file)." >&2
+    aborting=1
+#?  run git reset --hard
+    state="$( get_state )"
+    if [[  $state == rebase-i*  ]]; then
+        run git rebase --abort
+    fi
+    clean_up
+    exit 1
+}
+
+clean_up() {
+    okay=1
+    if [[  $onlyup  ]]; then
+        echo " > git diff --numstat $head" >&2
+        if  git diff --numstat $head | grep .;  then
+            echo "WARNING!  Above changes got introduced." >&2
+            okay=
+        else
+            echo "(No code changes introduced.)" >&2
+        fi
+    fi
+    state="$( get_state )"
+    if [[  $state != normal*  ]]; then
+        echo "Impossible?  Repo still has unfinished batch operation: $state" >&2
+        okay=
+    fi
+    if [[  ! $okay  ]]; then
+        [[ $stashed ]] && echo "Run 'git stash pop' when ready." >&2
+        exit 1
+    fi
+
+    [[ $stashed ]] && run git stash pop
+}
+
+spawn_shell() {
+    bash --rcfile <( echo '. ~/.bashrc; PS1="REBASE! $PS1"; \
+        echo \"exit\" to resume rebase-ing.' )
+}
+
+prev_state=$( git state )
+get_state() {
+    if [[  ! $fake  ]]; then
+        git state
+    else
+        echo -n "Repo state (like 'rebase-i conflict') [$prev_state] ? " >&2
+        if  read resp && [[ $resp ]];  then
+            prev_state="$resp"
+        fi
+        echo $prev_state
+    fi
+}
+
+
+while [[  1 -le $#  &&  $1 = -*  ]]; do
+    case "$1" in
+    -u) onlyup=
+        ;;
+    -n) if [[  $fake  ]]; then # -n -n:
+            fake=fake
+            eval 'fake() {
+                echo "$@"
+                echo -n "Failed? "
+                read resp && [[ $resp != y* ]] && return 0
+                return 1
+            }'
+        else
+            fake=true
+        fi
+        ;;
+    --root)
+        break
+        ;;
+    *)  echo "Unknown option: $1" >&2
+        set -- next show usage
+        ;;
+    esac
+    shift
+done
+
+if [[  1 -lt $#  ]]; then
+    exec >&2
+    echo 'Usage: git rework [-u] [-n [-n]] [$upstream|--root]'
+    echo '    -n: Just pretend to make git changes (for testing this script).'
+    echo '    -u: Allow rebasing onto a commit that is not upstream.'
+    echo 'Like: git stash save rebase; git rebase -i @{u}; git stash pop'
+    exit 1
+fi
+
+state="$( get_state )"
+if [[  $state != normal*  ]]; then
+    exec >&2
+    echo "Your repository is still in a batch operation: $state" >&2
+    exit 1
+elif [[  $state = *conflict*  ]]; then
+    exec >&2
+    echo "Your repository has unresolved merge conflicts: $state" >&2
+    exit 1
+fi
+
+anycommits="git rev-list -n1"
+
+upstream='?'
+if [[  1 == $#  ]]; then
+    upstream="$1"
+else
+    merge=
+    if  $anycommits @{u}.. >/dev/null;  then
+        merge="$( $anycommits --merges @{u}.. )"
+        [[  ! $merge  ]] && upstream='@{u}'
+    else
+        merge="$( $anycommits --merges )"
+        [[  ! $merge  ]] && upstream=
+    fi
+    if [[  $upstream = '?'  ]]; then
+        upstream="$(git rev-list "$merge".. | tail -1 )^"
+    fi
+fi
+
+if [[  "--root" == $upstream  ]]; then
+    onlyup=true
+    if  $anycommits --merges HEAD | grep -q .;  then
+        echo "You have merges committed." >&2
+        exit 1
+    elif  ! $anycommits --no-merges HEAD | grep -q .;  then
+        echo "You have no changes committed." >&2
+        exit 1
+    fi
+elif [[  $upstream  ]]; then
+    if  ! $anycommits ..$upstream >/dev/null;  then
+        echo >&2
+        echo $upstream "is not a valid commit?" >&2
+        exit 1
+    elif  $anycommits ..$upstream | grep -q .;  then
+        if [[  $onlyup  ]]; then
+            echo $upstream "is not up-stream from HEAD." >&2
+            exit 1
+        fi
+    else
+        onlyup=true
+    fi
+    if  $anycommits --merges $upstream.. | grep -q .;  then
+        echo "You have merges committed since" $upstream. >&2
+        exit 1
+    elif  ! $anycommits --no-merges $upstream.. | grep -q .;  then
+        echo "You have no changes committed since" $upstream. >&2
+        exit 1
+    fi
+fi
+if [[  ! -t 0  ]]; then
+    echo "STDIN must be your TTY for an *interactive* rebase." >&2
+    exit 1
+elif [[  ! -t 1  ]]; then
+    echo "STDOUT must be your TTY for an *interactive* rebase." >&2
+    exit 1
+elif [[  ! -t 2  ]]; then
+    echo "STDERR must be your TTY for an *interactive* rebase."
+    exit 1
+fi
+
+head=$( git rev-parse HEAD )
+if [[  $state != *clean*  ]]; then
+    run git stash save rebase: git-rework
+    stashed=1
+fi
+
+run git rebase -i $upstream
+
+state="$( get_state )"
+while [[  $state = rebase-i*  ]]; do
+    if [[  $state = *conflict*  ]]; then
+        while [[  $state = rebase-i*conflict*  ]]; do
+            echo -n "Run mergetool ('no' for shell; Ctrl-D to abort rebase) ? "
+            if  ! read resp;  then
+                abort_rebase
+            elif [[  $resp = n*  ]]; then
+                spawn_shell
+            else
+                run git mergetool
+            fi
+            state="$( get_state )"
+        done
+    else
+        spawn_shell
+        state="$( get_state )"
+    fi
+    while [[  $state = rebase-i*  ]]; do
+        echo -n "Resume 'rebase -i' ('no' for shell; Ctrl-D to abort rebase) ? "
+        if  ! read resp;  then
+            abort_rebase
+        elif [[  $resp = n*  ]]; then
+            spawn_shell
+        else
+            break
+        fi
+        state="$( get_state )"
+    done
+    if [[  $state = rebase-i*  ]]; then
+        run git rebase --continue
+        state="$( get_state )"
+    fi
+done
+
+clean_up

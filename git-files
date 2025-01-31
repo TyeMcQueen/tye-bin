@@ -1,0 +1,25 @@
+#!/usr/bin/perl -w
+use strict;
+
+Main( @ARGV );
+exit;
+
+sub Usage {
+    die join "\n",
+        'Usage: git-files REGEX [COMMIT] [GLOB ...]',
+        '   Rougly the same as: git grep -l ...',
+        '   Except, if COMMIT is given, reports "t/foo" not "COMMIT:t/foo"',
+    '';
+}
+
+sub Main {
+    Usage()
+        if  ! @_;
+    open LIST, '-|', 'git', 'grep', '-l', @_
+        or  die "Can't fork to run git-grep: $!\n";
+    $| = 1;
+    while( <LIST> ) {
+        s/^[^:]+://;
+        print;
+    }
+}

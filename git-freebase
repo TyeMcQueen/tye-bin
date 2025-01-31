@@ -1,0 +1,210 @@
+#!/usr/bin/perl -w
+use strict;
+
+use Getopt::Long    qw< GetOptions >;
+
+Main( @ARGV );
+exit;
+
+
+sub Usage {
+    my @msg = @_;
+    my $usage = join "\n",
+        'Usage: git freebase [options] $PRIOR..[$LAST] $ONTO',
+    #   '   or: git freebase --finish [ $BRANCH [$BRANCH2] ]',
+    #   '   or: git freebase --continue',
+    ;
+    die "$usage\n@msg\n"
+        if  @msg;
+    die join( "\n    ",
+        $usage,
+        'Cherry-picks the commits of $PRIOR..$LAST onto $ONTO.',
+        'Options:',
+        '    -p | --preserve-merges: Try to replicate merges.',
+        '    -i | --ignore-merges: Ignores merges in $PRIOR..$LAST',
+        '    --shift: $LAST must be a branch name which gets moved.',
+        '    --append: $ONTO must be a branch name which gets moved.',
+        'Without --shift or --append, no branches are modified.',
+        'With both --shift/--append, the branches $LAST/$ONTO become equal.',
+        '$LAST defaults to HEAD (must have a current branch for --shift).',
+        'Empty commits and commits that become empty are dropped.',
+    #   'Empty commits are kept, but commits that become empty are dropped.',
+    ), $/;
+#   git freebase --shift @{u}.. @{u}            => git rebase -f
+#   git freebase --shift @{u}.. $ONTO           => git rebase --onto $ONTO
+#   git freebase --shift $PRIOR..               => git rebase $PRIOR
+#   git freebase --shift $PRIOR..$LAST @{u}     => git rebase $PRIOR $LAST
+}
+
+
+sub Main {
+    my @args = @_;
+    my( $prior, $last, $onto, $for_merges, $shift, $append ) =
+        CommandLine( @args );
+    CheckRepo( $prior, $last, $onto, $for_merges, $shift, $append );
+    $_ = GetSha( $_ )
+        for $prior, $last, $onto;
+
+    Run( "git checkout --no-track -B __freebase__ $last" );
+    $for_merges = 'p' eq $for_merges ? '--preserve-merges' : '';
+    Run( "git rebase $for_merges --onto $onto $prior" );
+    my $final = GetSha("HEAD");
+    Run( "git checkout $final" );       # Disconnect from __freebase__ branch.
+    Run( "git branch -D __freebase__" );
+    MoveBranch( $shift, $last, $final )
+        if  $shift;
+    MoveBranch( $append, $onto, $final )
+        if  $append;
+}
+
+
+sub MoveBranch {
+    my( $branch, $start, $final ) = @_;
+    Run( "git checkout $branch" );
+    Run( "git reset --hard $final" );
+    print "Branch $branch moved from $start to $final\n";
+    my $remote = Run( "git config branch.$branch.remote" );
+    if( ! $remote ) {
+        my $added = Commits( "$start.." );
+        my $lost  = Commits( "..$start" );
+        print "    adding $added commits and losing $lost.\n";
+    } else {
+        my $push = Commits( '@{u}..' );
+        my $pull = Commits( '..@{u}' );
+        if( $push ) {
+            if( $pull ) {
+                print "    with $push commits to push, $pull to pull.\n";
+            } else {
+                print "    with $push commits to push.\n";
+            }
+        } elsif( $pull ) {
+            print "    with $pull commits to pull.\n";
+        } else {
+            my $pair = Run( "git config branch.$branch.merge" );
+            $pair =~ s{^.*/}{};
+            if( $pair eq $branch ) {
+                print "    and now matches ${remote}'s.\n";
+            } else {
+                print "    and now matches $remote/$pair.\n";
+            }
+        }
+    }
+}
+
+
+sub CommandLine {
+    my @args = @_;
+    Getopt::Long::Configure(
+        'no_getopt_compat', # No +foo
+        'bundling',         # Allow -ip (for -i -p)
+        'require_order',    # Stop at non-option
+        'no_auto_abbrev',   # Don't allow -e if we didn't define such
+    );
+    local @ARGV = @args;
+    GetOptions(
+        'shift'             => \ ( my $shift = 0 ),
+        'append'            => \ ( my $append = 0 ),
+        'p|preserve-merges' => \ ( my $keep = 0 ),
+        'i|ignore-merges'   => \ ( my $ignore = 0 ),
+    )   or  die "Error processing command-line options.\n";
+    Usage()
+        if  ! @ARGV;
+    Usage( "Must give exactly 2 arguments, not", 0+@ARGV, '.' )
+        if  2 != @ARGV;
+    my( $range, $onto ) = @ARGV;
+    my $count = my( $prior, $last ) = split /[.][.]/, $range;
+    Usage( "Must have 1 instance of '..' in first argument (not $range)" )
+        if  2 != $count;
+    my $for_merges = join '', $keep ? 'p' : '', $ignore ? 'i': '';
+    Usage( "Can't use both -p and -i in same command" )
+        if  1 < length $for_merges;
+    if( ! $last ) {
+        $last = GetHead();
+        $last =~ s|^refs/heads/||;
+    }
+    for( $prior, $last, $onto ) {
+        die "Unsupported character ($1) in commit name ($_)\n"
+            if  m{([^-a-zA-Z0-9_+,./:=\@{}^~])};
+    }
+    $shift &&= $last;
+    $append &&= $onto;
+    return( $prior, $last, $onto, $for_merges, $shift, $append );
+}
+
+
+sub CheckRepo {
+    my( $prior, $last, $onto, $for_merges, $shift, $append ) = @_;
+    my $state = Run( "git state" );
+    die "Refusing to rebase with your repo while in busy state: $state\n"
+        if  'normal clean' ne $state;
+    die "Can't use --shift since $shift is not a branch.\n"
+        if  $shift && ! Run( "git branch --list $shift" );
+    die "Can't use --append since $append is not a branch name.\n"
+        if  $append && ! Run( "git branch --list $append" );
+    my $commits = Commits( "--no-merges $prior..$last" );
+    my $merges =  Commits( "--merges    $prior..$last" );
+    Usage( "Refusing to rebase $merges merges without either -i or -p" )
+        if  $merges && ! $for_merges;
+    die "Nothing to rebase\n"
+        if  ! $commits && ( ! $merges || 'i' eq $for_merges );
+    die "Commit $last is already part of $onto; nothing to add.\n"
+        if  ! Commits( "-n1 $onto..$last" );
+}
+
+
+sub Commits {
+    my( $args ) = @_;
+    my @commits = Run( "git rev-list --first-parent $args --" );
+    return 0+@commits
+        if  ! wantarray;
+    chomp @commits;
+    return @commits;
+}
+
+
+sub Run {
+    my( $cmd ) = @_;
+    my @output = qx{ $cmd };
+    die "Above failure was from: $cmd\n"
+        if  $?;
+    return @output
+        if  wantarray;
+    chomp( my $output = join '', @output );
+    return $output;
+}
+
+
+# Get name of current branch or SHA of current comment.
+
+sub GetHead {
+    my $head = Run(
+        "git symbolic-ref HEAD 2>/dev/null || echo HEAD" );
+    return $head;
+}
+
+
+sub GetSha {
+    my( $commit ) = @_;
+    my( $sha ) = Commits( "-n1 $commit" );
+    return $sha;
+}
+
+__END__
+
+       git rebase [-i | --interactive] [options] [--onto <newbase>]
+               [<upstream>] [<branch>]
+       git rebase [-i | --interactive] [options] --onto <newbase>
+               --root [<branch>]
+
+       git rebase --continue | --skip | --abort
+
+git freebase [--shift|--append] $up..[$head] $onto
+(can use git-rebase for --shift where $branch eq $head)
+(complain if $branch given but not either $head or $onto or a new branch?)
+git rebase [$up] [--onto $onto] [$branch]
+
+git co $head
+git co -b $temp
+git rebase $up --onto $onto
+git branch -d $temp
+[ git co $branch; git reset --keep ]

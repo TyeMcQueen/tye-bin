@@ -1,0 +1,24 @@
+#!/bin/bash
+
+if [[  2 != $#  ]]; then
+    echo "Usage: git cat REV FILE" >&2
+    echo "   or: git cat :[{0-3}|base|ours|we|theirs|they] FILE" >&2
+    exit 1
+fi
+rev="$1"
+tree=
+if [[  "$rev" == :  ]]; then
+    rev=''
+elif [[  "$rev" == :*  ]]; then
+    :
+elif [[  "$rev" == *:  ]]; then
+    # Treat 0: the same as :0
+    rev=":${rev%:}"
+else
+    tree="--with-tree=$rev"
+fi
+
+# echo " > git ls-files --error-unmatch $tree --full-name -- $2" >&2
+path="$(git ls-files --error-unmatch $tree --full-name -- "$2")" || exit $?
+# echo " > git -p cat-file blob $rev:$path" >&2
+git -p cat-file blob "$rev:$path"
